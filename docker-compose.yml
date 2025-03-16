@@ -3,41 +3,56 @@ version: '3.8'
 services:
   web:
     build:
-      context: .
+      context: ./backend
       dockerfile: Dockerfile
+      args:
+        - ENVIRONMENT=${ENVIRONMENT:-dev}
     container_name: web_app
     env_file:
-      - app/env/.env
-      - app/env/.uvicorn.env
+      - env/.env.${ENVIRONMENT}
     ports:
-      - "4001:4001"
-    command: [ "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "4001" ]
+      - "8000:8000"
+    environment:
+      - PYTHONUNBUFFERED=1
+      - PYTHONPATH=/usr/src/backend
     volumes:
-      - ./app:/usr/src/app:cached
-      - pip_cache:/root/.cache
+      - ./backend/src:/app/src:cached
     depends_on:
-      - db
+      db:
+        condition: service_healthy
+    networks:
+      - app-network
     healthcheck:
-      test: [ "CMD", "curl", "-f", "http://localhost:4001/health" ]
+      test: [ "CMD-SHELL", "curl -f http://localhost:8000/health || exit 1" ]
       interval: 30s
       timeout: 10s
       retries: 5
+      start_period: 20s
 
   db:
-    image: mariadb:latest
+    image: mariadb:11.3
     container_name: app_db
     env_file:
-      - app/env/.mariadb.env
+      - env/.env.${ENVIRONMENT:-dev}
+    environment:
+      - MARIADB_ROOT_PASSWORD=${MARIADB_ROOT_PASSWORD}
+      - MARIADB_DATABASE=${MARIADB_DATABASE}
+      - MARIADB_USER=${MARIADB_USER}
+      - MARIADB_PASSWORD=${MARIADB_PASSWORD}
+      - MARIADB_AUTO_UPGRADE=1
     ports:
       - "3306:3306"
     volumes:
-      - db:/var/lib/mysql
+      - db_data:/var/lib/mysql
       - backups:/backups
+    networks:
+      - app-network
     healthcheck:
-      test: [ "CMD", "mysqladmin", "ping", "-h", "localhost" ]
-      interval: 30s
-      timeout: 10s
-      retries: 5
+      test: [ "CMD", "healthcheck.sh", "--connect", "--innodb_initialized" ]
+      start_period: 10s
+      interval: 10s
+      timeout: 5s
+      retries: 3
 
   adminer:
     image: adminer
@@ -45,37 +60,94 @@ services:
     depends_on:
       - db
     env_file:
-      - app/env/.env
+      - env/.env.${ENVIRONMENT:-dev}
     ports:
       - "8080:8080"
+    networks:
+      - app-network
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: app_rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"  # For the management UI (optional)
+    networks:
+      - app-network
 
   redis:
     image: redis:latest
     container_name: app_redis
     ports:
       - "6379:6379"
+    networks:
+      - app-network
+    healthcheck:
+      test: [ "CMD", "redis-cli", "ping" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
 
   celery:
     build:
-      context: .
+      context: ./backend
       dockerfile: Dockerfile
     container_name: app_celery
     command: celery -A celery worker --loglevel=info
+    env_file:
+      - env/.env.${ENVIRONMENT:-dev}
     depends_on:
+      - rabbitmq
       - redis
       - db
+    networks:
+      - app-network
+    healthcheck:
+      test: [ "CMD-SHELL", "celery inspect ping -A celery || exit 1" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
 
   celery_beat:
     build:
-      context: .
+      context: ./backend
       dockerfile: Dockerfile
     container_name: app_celery_beat
     command: celery -A celery beat --loglevel=info
+    env_file:
+      - env/.env.${ENVIRONMENT:-dev}
     depends_on:
       - redis
       - db
+    networks:
+      - app-network
+    healthcheck:
+      test: [ "CMD-SHELL", "test -f /tmp/celerybeat.pid || exit 1" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: frontend_app
+    ports:
+      - "80:80"  # Nginx will serve your React app on port 80
+    depends_on:
+      web:
+        condition: service_healthy
+    networks:
+      - app-network
 
 volumes:
-  pip_cache:
-  db:
+  db_data:
   backups:
+  pip_cache:
+
+networks:
+  app-network:
+    driver: bridge
